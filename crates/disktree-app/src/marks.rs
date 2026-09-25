@@ -109,13 +109,35 @@ pub fn is_hidden(path: &Path) -> bool {
 /// Shorten a path for display: `~` for the home directory, and the path with
 /// the home prefix replaced when it is below it.
 pub fn display_path(path: &Path, home: Option<&Path>) -> String {
-    match home
+    let shown = match home
         .and_then(|home| path.strip_prefix(home).ok().map(|rest| (home, rest)))
     {
         Some((_, rest)) if rest.as_os_str().is_empty() => "~".to_string(),
         Some((_, rest)) => format!("~/{}", rest.display()),
         None => path.display().to_string(),
+    };
+    strip_verbatim(shown)
+}
+
+/// A path with no friendlier shortening, still without the `\\?\`
+/// prefix `canonicalize` adds on Windows.
+pub fn plain_path(path: &Path) -> String {
+    strip_verbatim(path.display().to_string())
+}
+
+/// `canonicalize` on Windows spells `C:\` as `\\?\C:\` so the APIs
+/// accept long paths. The trail the user reads should not.
+fn strip_verbatim(path: String) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = path.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
     }
+    path
 }
 
 #[cfg(test)]
@@ -227,5 +249,24 @@ mod tests {
         assert_eq!(display_path(home, Some(home)), "~");
         assert_eq!(display_path(Path::new("/var/log"), Some(home)), "/var/log");
         assert_eq!(display_path(Path::new("/var/log"), None), "/var/log");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn display_path_hides_the_verbatim_prefix() {
+        let home = Path::new(r"\\?\C:\Users\me");
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Users\me\src"), Some(home)),
+            "~/src"
+        );
+        assert_eq!(
+            display_path(Path::new(r"\\?\C:\Windows"), Some(home)),
+            r"C:\Windows"
+        );
+        assert_eq!(plain_path(Path::new(r"\\?\C:\")), r"C:\");
+        assert_eq!(
+            plain_path(Path::new(r"\\?\UNC\server\share")),
+            r"\\server\share"
+        );
     }
 }

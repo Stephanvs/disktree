@@ -5,6 +5,10 @@
 //! live free-space meter. Marking is non-destructive until the review screen
 //! is confirmed.
 
+// A console window shares the process. Closing that window ends the
+// scan, so the Windows build is a GUI program and has no console.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod git;
 mod marks;
 mod palette;
@@ -82,9 +86,7 @@ fn main() -> Result<()> {
                                     "disktree · {}",
                                     marks::display_path(
                                         &title_root,
-                                        std::env::var_os("HOME")
-                                            .map(PathBuf::from)
-                                            .as_deref(),
+                                        disktree_core::home_dir().as_deref(),
                                     )
                                 )
                                 .into(),
@@ -173,16 +175,32 @@ fn parse_args() -> Result<Args> {
         !(disk && root.is_some()),
         "--disk and a PATH cannot be combined"
     );
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = disktree_core::home_dir();
     let root = match root {
-        _ if disk => home
+        _ if disk => match home
             .as_deref()
             .and_then(disktree_core::space::volume_root_for)
-            .unwrap_or_else(|| PathBuf::from("/")),
+        {
+            Some(root) => root,
+            None => {
+                // Linux: `/` is the disk when the mount table cannot
+                // be read. Windows has no such fallback.
+                #[cfg(windows)]
+                {
+                    anyhow::bail!(
+                        "cannot find the disk the home directory is on"
+                    );
+                }
+                #[cfg(not(windows))]
+                {
+                    PathBuf::from("/")
+                }
+            }
+        },
         Some(root) => root,
-        None => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .context("no path given and HOME is not set")?,
+        None => {
+            home.context("no path given and no home directory was found")?
+        }
     };
     // Store the depth as the initial view setting rather than a scan option: it
     // is a display choice the run-time `[` and `]` keys also change.

@@ -654,7 +654,11 @@ fn allocated_bytes(meta: &Metadata) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn allocated_bytes(_meta: &Metadata) -> Option<u64> {
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Option is the non-Unix answer, where the caller falls back"
+)]
+const fn allocated_bytes(_meta: &Metadata) -> Option<u64> {
     None
 }
 
@@ -665,7 +669,10 @@ fn device_of(meta: &Metadata) -> u64 {
 }
 
 #[cfg(not(unix))]
-fn device_of(_meta: &Metadata) -> u64 {
+const fn device_of(_meta: &Metadata) -> u64 {
+    // A directory entry here does not carry a volume id. Junctions and
+    // volume mount points are reparse points, reported as symlinks, and
+    // the walk does not follow those unless asked.
     0
 }
 
@@ -683,7 +690,11 @@ fn file_identity(meta: &Metadata) -> Option<(u64, u64)> {
 }
 
 #[cfg(not(unix))]
-fn file_identity(_meta: &Metadata) -> Option<(u64, u64)> {
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Option is the non-Unix answer, so both arms must agree"
+)]
+const fn file_identity(_meta: &Metadata) -> Option<(u64, u64)> {
     None
 }
 
@@ -796,6 +807,7 @@ mod tests {
         assert_eq!(tree.files, 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn hardlinks_are_charged_once_by_default() {
         let temp = TempDir::new().expect("tempdir");
@@ -838,6 +850,7 @@ mod tests {
         assert_eq!(without.bytes, 100);
     }
 
+    #[cfg(unix)]
     #[test]
     fn symlinks_are_not_followed_by_default() {
         let temp = TempDir::new().expect("tempdir");
@@ -857,6 +870,7 @@ mod tests {
         assert!(link.bytes < 100, "a link holds only its target string");
     }
 
+    #[cfg(unix)]
     #[test]
     fn followed_symlink_loops_do_not_hang_the_scan() {
         let temp = TempDir::new().expect("tempdir");
@@ -927,6 +941,7 @@ mod tests {
         assert_eq!(by_files.children[0].files, 5);
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_unreadable_directory_is_recorded_not_fatal() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1040,7 +1055,7 @@ mod tests {
     #[test]
     #[ignore = "walks the whole disk"]
     fn whole_disk_smoke() {
-        let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
+        let home = crate::home_dir().expect("a home directory");
         let root = crate::space::volume_root_for(&home).expect("a volume root");
         let started = std::time::Instant::now();
         let tree = scan(&root, ScanOptions::default()).expect("scan");

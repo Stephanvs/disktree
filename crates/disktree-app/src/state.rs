@@ -414,7 +414,7 @@ impl Disktree {
         depth: u32,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = disktree_core::home_dir();
         let space = space_info(&root_path).ok();
         let trash_backend = detect_trash_backend();
         let mut tree = Self {
@@ -2411,7 +2411,7 @@ const HEADER_INNER_REMS: f32 = 1.0;
 /// A trail step's label: the directory's own name, or `/` for the root.
 fn crumb_label(path: &Path) -> String {
     path.file_name().map_or_else(
-        || path.display().to_string(),
+        || crate::marks::plain_path(path),
         |name| name.to_string_lossy().into_owned(),
     )
 }

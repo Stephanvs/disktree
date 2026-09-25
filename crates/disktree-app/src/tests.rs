@@ -943,9 +943,11 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     });
     let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
 
-    // The trail runs from "/", and the scanned root sits under its parents.
+    // The trail runs from the volume root (`/` on Unix, `C:\` on
+    // Windows), and the scanned root sits under its parents.
     let trail = read(&view, cx, Disktree::breadcrumbs);
-    assert_eq!(trail[0].0, "/");
+    let volume = inner.ancestors().last().expect("a volume root");
+    assert_eq!(trail[0].0, crate::marks::plain_path(volume));
     assert!(
         trail.contains(&(
             temp.path()

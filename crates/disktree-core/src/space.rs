@@ -7,6 +7,9 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+#[cfg(windows)]
+use std::path::Component;
+
 /// A volume's capacity in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SpaceInfo {
@@ -50,6 +53,18 @@ impl SpaceInfo {
 
 /// Read the space on the volume containing `path`.
 pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
+    #[cfg(windows)]
+    {
+        windows_space_info(path)
+    }
+    #[cfg(not(windows))]
+    {
+        unix_space_info(path)
+    }
+}
+
+#[cfg(not(windows))]
+fn unix_space_info(path: &Path) -> io::Result<SpaceInfo> {
     let stat = rustix::fs::statvfs(path)?;
     // `f_frsize` is the fragment size the block counts are expressed in;
     // `f_bsize` is only a hint for I/O. Some filesystems report zero for
@@ -66,13 +81,67 @@ pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
     })
 }
 
+/// `GetDiskFreeSpaceExW`: std has no volume-size API, and `rustix`'s
+/// `statvfs` is not built on Windows.
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "GetDiskFreeSpaceExW is not wrapped by std")]
+fn windows_space_info(path: &Path) -> io::Result<SpaceInfo> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // A file or a directory both name the volume they sit on.
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let mut available = 0_u64;
+    let mut total = 0_u64;
+    let mut free = 0_u64;
+    // SAFETY: `wide` is NUL-terminated and lives across the call. The
+    // three pointers address these locals.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &raw mut available,
+            &raw mut total,
+            &raw mut free,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(SpaceInfo {
+            total,
+            free,
+            available,
+        })
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code, reason = "GetDiskFreeSpaceExW is not wrapped by std")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetDiskFreeSpaceExW(
+        directory: *const u16,
+        available: *mut u64,
+        total: *mut u64,
+        free: *mut u64,
+    ) -> i32;
+}
+
 /// The device a path's filesystem is mounted from, such as
-/// `/dev/nvme0n1p2`: the mount with the longest prefix of `path` in
-/// `/proc/self/mounts`. `None` where that table cannot be read.
+/// `/dev/nvme0n1p2`, or the drive (`C:`) on Windows. `None` where that
+/// cannot be read.
 pub fn device_for(path: &Path) -> Option<String> {
-    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    device_in(&table, &path)
+    #[cfg(windows)]
+    {
+        windows_volume_root(path).map(|root| volume_label(&root))
+    }
+    #[cfg(not(windows))]
+    {
+        let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        device_in(&table, &path)
+    }
 }
 
 /// [`device_for`] over a given mount table, for testing.
@@ -186,10 +255,59 @@ pub fn volume_root(mounts: &[Mount], path: &Path) -> Option<PathBuf> {
 }
 
 /// [`volume_root`] for this machine.
+///
+/// On Windows there is no mount table to walk: the volume is the drive
+/// or UNC share the path is already on. Junctions to another volume are
+/// reparse points, and the scan does not follow those.
 pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
-    let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+    #[cfg(windows)]
+    {
+        windows_volume_root(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        volume_root(&parse_mounts(&table), &path)
+    }
+}
+
+/// Drive or UNC root of `path`, after canonicalizing so `C:\` and
+/// `\\?\C:\` agree with a scanned root.
+#[cfg(windows)]
+fn windows_volume_root(path: &Path) -> Option<PathBuf> {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    volume_root(&parse_mounts(&table), &path)
+    let mut components = path.components();
+    match components.next()? {
+        Component::Prefix(prefix) => {
+            let mut root = PathBuf::from(prefix.as_os_str());
+            // `C:` alone is relative to the drive's cwd. Append the
+            // root separator by hand: `PathBuf::push(r"\")` replaces
+            // the prefix instead of extending it.
+            if matches!(components.next(), Some(Component::RootDir)) {
+                let mut text = root.into_os_string();
+                text.push(r"\");
+                root = PathBuf::from(text);
+            }
+            Some(root)
+        }
+        Component::RootDir => Some(PathBuf::from(r"\")),
+        Component::CurDir | Component::ParentDir | Component::Normal(_) => None,
+    }
+}
+
+/// `\\?\C:\` is how the APIs spell a drive. The panel wants `C:`.
+#[cfg(windows)]
+fn volume_label(root: &Path) -> String {
+    let text = root.display().to_string();
+    let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        text
+    };
+    text.trim_end_matches(['\\', '/']).to_string()
 }
 
 /// [`foreign_mounts`] for this machine; `None` when the mount table cannot
@@ -286,6 +404,36 @@ tmpfs /tmp tmpfs rw 0 0
         let error = space_info(Path::new("/definitely/not/here"))
             .expect_err("no volume");
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_volume_root_is_the_drive() {
+        let temp = std::env::temp_dir();
+        let root = volume_root_for(&temp).expect("a drive");
+        let canon = temp.canonicalize().unwrap_or(temp);
+        assert!(
+            canon.starts_with(&root),
+            "{} vs {}",
+            canon.display(),
+            root.display()
+        );
+        assert!(
+            root.components().all(|component| {
+                matches!(
+                    component,
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                )
+            }),
+            "{}",
+            root.display()
+        );
+        let device = device_for(&canon).expect("a drive letter");
+        assert!(
+            device.ends_with(':') || device.starts_with(r"\\"),
+            "{device}"
+        );
     }
 
     #[test]

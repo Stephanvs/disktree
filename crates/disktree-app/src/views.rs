@@ -1825,7 +1825,7 @@ fn find_field(app: &Disktree, theme: &Theme) -> Div {
 
 fn short_name(path: &std::path::Path) -> String {
     path.file_name().map_or_else(
-        || path.display().to_string(),
+        || crate::marks::plain_path(path),
         |name| name.to_string_lossy().into_owned(),
     )
 }
@@ -2847,7 +2847,10 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
                         .text_color(theme.secondary)
                         .child(format!(
                             "? or esc closes \u{00b7} {} \u{00b7} {}",
-                            app.root_path.display(),
+                            crate::marks::display_path(
+                                &app.root_path,
+                                app.home.as_deref(),
+                            ),
                             app.options.metric.label()
                         )),
                 ),

@@ -12,6 +12,8 @@
 //! * [`RemovalMode::Trash`] — move to the desktop trash, using `trash-put`,
 //!   then `gio trash`, then a built-in XDG implementation. The backend is
 //!   detected once and named in the UI so the user knows what actually happens.
+//!   Those tools are a Unix desktop; on Windows trash is unavailable and
+//!   removal is permanent.
 
 use std::fs;
 use std::io;
@@ -92,7 +94,7 @@ impl Plan {
 /// looking at is the only thing they consented to act on.
 pub fn plan(targets: &[Target], root: &Path) -> Plan {
     let root = normalize(root);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = crate::home_dir();
     let mut plan = Plan::default();
     let mut accepted: Vec<Target> = Vec::new();
 
@@ -135,6 +137,7 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
 /// and removing them by hand breaks the system; pacman, paccache and
 /// `journalctl --vacuum` are the right tools. Refused even where
 /// permissions would allow it, and even inside them.
+#[cfg(not(windows))]
 const SYSTEM_TREES: [&str; 14] = [
     "/bin",
     "/boot",
@@ -152,16 +155,43 @@ const SYSTEM_TREES: [&str; 14] = [
     "/efi",
 ];
 
+/// Directories Windows owns, matched by the first real component so a
+/// verbatim `\\?\` prefix and any drive letter still hit them.
+#[cfg(windows)]
+const WINDOWS_TREES: &[(&str, &str)] = &[
+    ("Windows", "Windows"),
+    ("Program Files", "Program Files"),
+    ("Program Files (x86)", "Program Files (x86)"),
+    ("ProgramData", "ProgramData"),
+];
+
 /// The system tree `path` is in, if any. The home directory is never
 /// system, wherever it lives.
 fn system_tree(path: &Path, home: Option<&Path>) -> Option<&'static str> {
     if home.is_some_and(|home| path.starts_with(normalize(home))) {
         return None;
     }
-    SYSTEM_TREES
-        .iter()
-        .find(|tree| path.starts_with(tree))
-        .copied()
+    #[cfg(windows)]
+    {
+        let name = path.components().find_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            Component::Prefix(_)
+            | Component::RootDir
+            | Component::CurDir
+            | Component::ParentDir => None,
+        })?;
+        WINDOWS_TREES
+            .iter()
+            .find(|(dir, _)| name.eq_ignore_ascii_case(dir))
+            .map(|(_, label)| *label)
+    }
+    #[cfg(not(windows))]
+    {
+        SYSTEM_TREES
+            .iter()
+            .find(|tree| path.starts_with(tree))
+            .copied()
+    }
 }
 
 fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
@@ -213,7 +243,7 @@ pub fn is_mount_point(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-pub fn is_mount_point(_path: &Path) -> bool {
+pub const fn is_mount_point(_path: &Path) -> bool {
     false
 }
 
@@ -287,14 +317,33 @@ impl TrashBackend {
             Self::XdgHome => {
                 "moves into ~/.local/share/Trash on the same volume"
             }
-            Self::Unavailable => {
-                "install trash-cli or keep deleting permanently"
-            }
+            Self::Unavailable => unavailable_detail(),
         }
     }
 }
 
+const fn unavailable_detail() -> &'static str {
+    #[cfg(unix)]
+    {
+        "install trash-cli or keep deleting permanently"
+    }
+    #[cfg(not(unix))]
+    {
+        "only permanent deletion is available on this system"
+    }
+}
+
 /// Detect the best available trash backend for this machine.
+///
+/// `trash-put`, `gio` and the XDG trash are a Unix desktop. Windows
+/// has a Recycle Bin, which this build does not speak.
+#[cfg(not(unix))]
+pub const fn detect_trash_backend() -> TrashBackend {
+    TrashBackend::Unavailable
+}
+
+/// Detect the best available trash backend for this machine.
+#[cfg(unix)]
 pub fn detect_trash_backend() -> TrashBackend {
     if which("trash-put") {
         TrashBackend::TrashPut
@@ -307,6 +356,7 @@ pub fn detect_trash_backend() -> TrashBackend {
     }
 }
 
+#[cfg(unix)]
 fn which(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -547,6 +597,7 @@ pub fn trash_into(_path: &Path, _trash: &Path) -> io::Result<()> {
 }
 
 /// `name`, or `name.1`, `name.2`, … until the name is free in `dir`.
+#[cfg(any(unix, test))]
 fn unique_name(dir: &Path, name: &str) -> (PathBuf, String) {
     let first = dir.join(name);
     if !first.exists() {
@@ -579,6 +630,7 @@ pub fn percent_encode(input: &str) -> String {
     out
 }
 
+#[cfg(unix)]
 fn deletion_date() -> String {
     // The specification wants ISO 8601 in local time; chrono is already in the
     // dependency graph, so use it rather than approximating the offset.
@@ -631,7 +683,7 @@ mod tests {
     fn the_root_and_home_are_refused() {
         let temp = tree();
         let root = temp.path();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = crate::home_dir();
         let mut targets = vec![target(Path::new("/"), 0), target(root, 0)];
         if let Some(home) = &home {
             targets.push(target(home, 0));
@@ -699,6 +751,7 @@ mod tests {
         assert!(temp.path().join("a/c.bin").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn permanent_removal_unlinks_a_symlink_instead_of_following_it() {
         let temp = tree();
@@ -740,6 +793,7 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_xdg_trash_moves_a_file_and_records_where_it_came_from() {
         // A private trash directory keeps the test out of the real trash can.
@@ -762,6 +816,7 @@ mod tests {
         assert!(info.contains("DeletionDate="));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_trash_info_path_is_restorable() {
         let trash = TempDir::new().expect("tempdir");
@@ -830,6 +885,7 @@ mod tests {
         assert!(root.join("a/one.bin").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_trash_tool_is_called_with_the_path_after_a_separator() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -858,6 +914,7 @@ mod tests {
         assert!(doomed.exists(), "the real tool would have moved it");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failing_trash_tool_reports_its_stderr() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -875,12 +932,18 @@ mod tests {
     #[test]
     fn detection_prefers_a_tool_this_machine_has() {
         let backend = detect_trash_backend();
-        if which("trash-put") {
-            assert_eq!(backend, TrashBackend::TrashPut);
+        #[cfg(unix)]
+        {
+            if which("trash-put") {
+                assert_eq!(backend, TrashBackend::TrashPut);
+            }
+            assert!(backend.is_available());
         }
-        assert!(backend.is_available());
+        #[cfg(not(unix))]
+        assert_eq!(backend, TrashBackend::Unavailable);
     }
 
+    #[cfg(unix)]
     #[test]
     fn system_trees_are_refused_in_a_whole_disk_scan() {
         let home = Path::new("/home/tobi");
@@ -910,5 +973,37 @@ mod tests {
         let reason =
             refuse(Path::new("/etc/hosts"), Path::new("/"), Some(home));
         assert!(reason.is_some_and(|reason| reason.contains("/etc")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_directories_are_refused() {
+        let home = Path::new(r"C:\Users\me");
+        assert_eq!(
+            system_tree(Path::new(r"C:\Windows\System32"), Some(home)),
+            Some("Windows")
+        );
+        assert_eq!(
+            system_tree(Path::new(r"\\?\C:\Program Files\app"), Some(home)),
+            Some("Program Files")
+        );
+        assert_eq!(
+            system_tree(Path::new(r"D:\program files (x86)\app"), Some(home)),
+            Some("Program Files (x86)")
+        );
+        assert_eq!(
+            system_tree(Path::new(r"C:\Users\me\Windows"), Some(home)),
+            None,
+            "a home is never a system tree"
+        );
+        let reason = refuse(
+            Path::new(r"C:\Windows\System32\cmd.exe"),
+            Path::new(r"C:\"),
+            Some(home),
+        );
+        assert!(reason.is_some_and(|reason| reason.contains("Windows")));
+        assert!(
+            refuse(Path::new(r"C:\"), Path::new(r"C:\"), Some(home)).is_some()
+        );
     }
 }
